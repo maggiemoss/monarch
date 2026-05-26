@@ -129,6 +129,29 @@ class Point(HyPoint, collections.abc.Mapping):
     pass
 
 
+@rust_struct("monarch_hyperactor::actor::Port")
+class Port:
+    @property
+    def _rank(self) -> Optional[int]: ...
+
+    def send(self, obj: object) -> None: ...
+
+    def send_message(self, message: PythonMessage) -> None: ...
+
+    async def resolve_and_send(self, result: object) -> None:
+        # This is Port.send with deferred-pickle resolution inserted before the
+        # already-serialized Result message is posted.
+        state = pickle(
+            result, allow_pending_pickles=True, allow_tensor_engine_references=False
+        )
+        message = PendingMessage(
+            PythonMessageKind.Result(rank=self._rank),
+            state,
+        )
+        resolved = await Future(coro=cast(Any, message).resolve())
+        cast(Any, self).send_message(resolved)
+
+
 @rust_struct("monarch_hyperactor::context::Instance")
 class Instance(abc.ABC):
     # Optional tensor engine factory for mocking. When set, this is used
@@ -1305,7 +1328,7 @@ class _Actor:
                         result = the_method(*args, **kwargs)
                     self._maybe_exit_debugger()
 
-            response_port.send(result)
+            await response_port.resolve_and_send(result)
         except Exception as e:
             log_endpoint_exception(e, method_name, ctx.actor_instance.actor_id)
             self._post_mortem_debug(e.__traceback__)
