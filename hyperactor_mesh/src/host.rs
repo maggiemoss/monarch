@@ -77,12 +77,12 @@ use hyperactor::channel::Rx;
 use hyperactor::channel::ServerError;
 use hyperactor::channel::Tx;
 use hyperactor::context;
+use hyperactor::gateway::GatewayFrontend;
 use hyperactor::gateway::GatewayServeHandle;
 use hyperactor::gateway::PeerAttachGuard;
 use hyperactor::mailbox::IntoBoxedMailboxSender as _;
 use hyperactor::mailbox::MailboxClient;
 use hyperactor::mailbox::MailboxServer;
-use hyperactor::mailbox::MessageEnvelope;
 /// Name of the local client proc on a host.
 ///
 /// See LP-1 (lazy activation) in module doc.
@@ -163,20 +163,24 @@ pub struct Host<M> {
     /// `Via(child_uid, ...)` prefix and reached via
     /// [`Gateway::attach_peer`] with a dial-based sender per child.
     /// Unknown destinations fall through to the gateway's forwarder
-    /// (a [`DialMailboxRouter`] by default).
+    /// (a [`DialMailboxRouter`] by default; replaced by
+    /// [`Gateway::serve_via`] when a duplex peer is attached).
+    ///
+    /// When the caller wires up a peer connection (with
+    /// [`Gateway::serve_via`] or [`Gateway::attach`]) *before*
+    /// constructing the host, all of these procs inherit the via
+    /// prefix in their bound addresses automatically: their port
+    /// locations are derived dynamically from this gateway's
+    /// [`Location::default_location`], which the peer link
+    /// rewrites to `Via(self_uid, peer_default)`.
     gateway: Gateway,
     manager: M,
     service_proc: Proc,
     local_proc: Proc,
-    /// Pre-bound frontend, consumed by [`Host::serve`].
-    frontend: Option<Frontend>,
-}
-
-/// Pre-bound frontend receiver the host hands to its gateway on
-/// [`Host::serve`]. The bound address is tracked separately as
-/// [`Host::frontend_addr`].
-struct Frontend {
-    rx: hyperactor::channel::ChannelRx<MessageEnvelope>,
+    /// Pre-bound frontend, consumed by [`Host::serve`]. Bound and
+    /// served entirely through the gateway — the host neither inspects
+    /// the transport nor rewrites the gateway's location.
+    frontend: Option<GatewayFrontend>,
 }
 
 impl<M: ProcManager> Host<M> {
@@ -205,10 +209,13 @@ impl<M: ProcManager> Host<M> {
     /// Like [`new_with_default`], but uses a caller-provided
     /// [`Gateway`] instead of creating one internally.
     ///
-    /// The host's frontend address is determined here (`addr` or the
-    /// bound `listener`). The gateway's default location is updated
-    /// to match so the legacy pseudo-singleton proc ids (system,
-    /// local) carry it and remote hosts can reach them by name.
+    /// Binding the frontend (`addr` or the bound `listener`), choosing
+    /// the transport, and adopting the frontend as the gateway's
+    /// advertised location are all owned by [`Gateway::bind_frontend`].
+    /// The host operates on a vanilla gateway: it never inspects the
+    /// transport nor rewrites the gateway's location. Adopting the
+    /// frontend address makes the legacy pseudo-singleton proc ids
+    /// (system, local) carry it so remote hosts can reach them by name.
     #[hyperactor::instrument(fields(addr=addr.to_string()))]
     pub async fn new_with_gateway(
         manager: M,
@@ -216,14 +223,9 @@ impl<M: ProcManager> Host<M> {
         listener: Option<std::net::TcpListener>,
         gateway: Gateway,
     ) -> Result<Self, HostError> {
-        // Bind the host's frontend eagerly so we know its address;
-        // hand the bound receiver to the gateway on `serve()`.
-        let (frontend_addr, rx) = channel::serve_with_listener(addr, listener)?;
-        let frontend = Frontend { rx };
-        // Adopt the local frontend address as the gateway's default
-        // so the legacy pseudo-singleton procs (service, local) carry
-        // it.
-        gateway.set_default_location(Location::from(frontend_addr.clone()));
+        // Bind the frontend through the gateway; served on `serve()`.
+        let frontend = gateway.bind_frontend(addr, listener)?;
+        let frontend_addr = frontend.addr().clone();
 
         // Establish a backend channel on the preferred transport.
         let (backend_addr, backend_rx) = channel::serve(ChannelAddr::any(manager.transport()))?;
@@ -232,7 +234,10 @@ impl<M: ProcManager> Host<M> {
         // share the host's gateway just like spawned children would
         // — no special routing path. Their bound port addresses are
         // derived dynamically from the gateway's `default_location`
-        // at bind time.
+        // at bind time, so a peer link established *before* this
+        // point (via [`Gateway::serve_via`] or [`Gateway::attach`])
+        // is honored automatically — every advertised address
+        // carries the via prefix and is reachable through the link.
         let service_proc = Proc::legacy_service_pseudo_singleton_on_gateway(gateway.clone());
         let local_proc = Proc::legacy_local_pseudo_singleton_on_gateway(gateway.clone());
         let service_proc_id = service_proc.proc_addr().clone();
@@ -278,9 +283,7 @@ impl<M: ProcManager> Host<M> {
     /// resolves.
     pub fn serve(&mut self) -> Result<GatewayServeHandle, HostError> {
         let frontend = self.frontend.take().ok_or(HostError::AlreadyServing)?;
-        use hyperactor::mailbox::MailboxServer as _;
-        let raw = self.gateway.clone().serve(frontend.rx);
-        Ok(GatewayServeHandle::from_simplex(self.gateway.clone(), raw))
+        Ok(self.gateway.serve_frontend(frontend))
     }
 
     /// The underlying proc manager.
@@ -308,9 +311,9 @@ impl<M: ProcManager> Host<M> {
     }
 
     /// Spawn a new process with the given `name`. On success, the
-    /// proc has been spawned, and is reachable through the returned
-    /// proc address. Its id derives from `name`; its location carries
-    /// a via hop that routes through this host's frontend.
+    /// proc has been spawned, and is reachable through the returned,
+    /// direct-addressed ProcId, which will be
+    /// `ProcId(self.addr(), name)`.
     pub async fn spawn(
         &mut self,
         name: String,
@@ -1494,6 +1497,7 @@ mod tests {
     use hyperactor::channel::TxStatus;
     use hyperactor::context::Mailbox;
     use hyperactor::mailbox::DialMailboxRouter;
+    use hyperactor::mailbox::MessageEnvelope;
     use hyperactor::port::Port;
 
     use super::testing::EchoActor;
